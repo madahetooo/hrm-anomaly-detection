@@ -1,0 +1,28 @@
+# HRM Crime Detection — Python dependencies
+#
+# Setup (macOS/Linux — uses a local virtual environment):
+#   python3 -m venv venv
+#   source venv/bin/activate
+#   pip install -r requirements.txt
+#
+# GPU users (CUDA 11.8) — replace torch/torchvision lines with:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#
+# The venv/ folder is already created in this project directory.
+
+# Deep learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Data science
+numpy>=1.24.0
+scikit-learn>=1.2.0
+
+# Image handling
+Pillow>=9.0.0
+
+# Plotting
+matplotlib>=3.7.0
+
+# Progress bars (optional but used in extractor)
+tqdm>=4.65.0
