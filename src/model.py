@@ -5,20 +5,23 @@ Architecture (two-level hierarchy with patch embedding):
 ─────────────────────────────────────────────────────────────
   Input:  [Batch, T=20, feature_dim=2048]  (T temporal segments)
 
-  Patch Embedding (2×2 patch)
+  Patch Embedding (2×2 patch) + Positional Embedding
       Groups every patch_t=2 consecutive temporal segments into one token.
       Projects [patch_t × feature_dim] → hidden_dim=64.
+      A learned positional embedding is added so segment order is encoded.
       Output: [Batch, T//patch_t = 10, hidden_dim=64]
 
   Level 1 — Windowed Attention Module (Swin-Transformer style)
       W-MSA : attention within non-overlapping windows of window_size=2
-      SW-MSA: attention in cyclically-shifted windows (shift=1)
-      Followed by MLP (dim_feedforward=256)
+      SW-MSA: attention in cyclically-shifted windows (shift=1) with an
+              attention mask that prevents wrapped tokens from attending
+              across the shift boundary.
+      Followed by MLP (dim_feedforward=256).
       Captures local relationships with reduced quadratic complexity.
 
   Level 2 — Global Temporal Reasoning Module
-      Dilated 1-D Convolutions with growing receptive fields
-      Models temporal evolution over the full video timeline.
+      Dilated 1-D Convolutions with kernel=3 and dilations 1 → 2 → 3,
+      giving receptive fields 3 → 5 → 7 over patch tokens.
 
   Fusion
       Concatenate local + global → linear projection back to hidden_dim
@@ -108,6 +111,7 @@ class WindowedAttentionLayer(nn.Module):
         super().__init__()
         self.window_size = window_size
         self.shift_size  = shift_size
+        self.n_heads     = n_heads
 
         # Shared attention (W-MSA and SW-MSA share weights)
         self.norm1  = nn.LayerNorm(embed_dim)
@@ -117,6 +121,12 @@ class WindowedAttentionLayer(nn.Module):
         self.attn = nn.MultiheadAttention(
             embed_dim, n_heads, dropout=dropout, batch_first=True
         )
+
+        # Cache for SW-MSA attention masks keyed by sequence length.
+        # After cyclic shift, tokens wrapped from the head sit next to tokens
+        # from the tail inside the last window; without a mask they would
+        # attend across that artificial boundary.
+        self._attn_mask_cache: dict = {}
 
         self.mlp = nn.Sequential(
             nn.Linear(embed_dim, mlp_dim),
@@ -142,6 +152,33 @@ class WindowedAttentionLayer(nn.Module):
         x  = x.view(B, nW, self.window_size, C)
         return x.reshape(B, T, C)
 
+    def _build_sw_attn_mask(self, T: int, device, dtype) -> torch.Tensor:
+        """
+        Build the SW-MSA attention mask for a sequence of length T.
+
+        Tokens are tagged by region: those that wrapped around (originally
+        the first `shift_size` positions) get region id 1, the rest get 0.
+        Inside each window, attention is allowed only between tokens of the
+        same region; cross-region pairs get -inf so softmax kills them.
+
+        Returned shape: [nW, ws, ws] (added to attn logits, broadcast over
+        heads after we expand to [B*nW*n_heads, ws, ws] in forward).
+        """
+        ws  = self.window_size
+        nW  = T // ws
+        # region[i] = 1 if token i came from the wrapped tail, else 0
+        region = torch.zeros(T, device=device)
+        if self.shift_size > 0:
+            region[-self.shift_size:] = 1
+        region = region.view(nW, ws)                          # [nW, ws]
+        diff = region.unsqueeze(2) - region.unsqueeze(1)      # [nW, ws, ws]
+        mask = torch.where(
+            diff == 0,
+            torch.zeros_like(diff, dtype=dtype),
+            torch.full_like(diff, float('-inf'), dtype=dtype),
+        )
+        return mask                                           # [nW, ws, ws]
+
     # ── forward ───────────────────────────────────────────────
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -159,7 +196,26 @@ class WindowedAttentionLayer(nn.Module):
             shortcut = x
             x_shifted = torch.roll(x, shifts=-self.shift_size, dims=1)
             x_norm_s, _, _, _ = self._partition(self.norm1s(x_shifted))
-            attn_out, _ = self.attn(x_norm_s, x_norm_s, x_norm_s)
+
+            # Mask cross-region attention inside each window.
+            nW = T // self.window_size
+            ws = self.window_size
+            cache_key = (T, x.device, x.dtype)
+            mask = self._attn_mask_cache.get(cache_key)
+            if mask is None:
+                mask = self._build_sw_attn_mask(T, x.device, x.dtype)
+                self._attn_mask_cache[cache_key] = mask
+            # nn.MultiheadAttention expects attn_mask of shape
+            # [B*n_heads, L, S] when batched. We have B*nW windows; expand
+            # the per-window mask across batch and heads.
+            attn_mask = (
+                mask.unsqueeze(0)                                   # [1, nW, ws, ws]
+                    .expand(B, nW, ws, ws)
+                    .reshape(B * nW, 1, ws, ws)
+                    .expand(B * nW, self.n_heads, ws, ws)
+                    .reshape(B * nW * self.n_heads, ws, ws)
+            )
+            attn_out, _ = self.attn(x_norm_s, x_norm_s, x_norm_s, attn_mask=attn_mask)
             x_unshift = self._reverse(attn_out, B, T)
             x = shortcut + torch.roll(x_unshift, shifts=self.shift_size, dims=1)
 
@@ -209,7 +265,7 @@ class WindowedAttentionModule(nn.Module):
 class GlobalTemporalReasoning(nn.Module):
     """
     Level 2: Models long-range temporal evolution with dilated 1-D convolutions.
-    Three layers with dilation 1 → 2 → 4.
+    Three layers with dilation 1 → 2 → 3, giving receptive fields 3 → 5 → 7.
     """
 
     def __init__(self, hidden_dim: int = 64, dropout: float = 0.03):
@@ -231,7 +287,7 @@ class GlobalTemporalReasoning(nn.Module):
         self.conv_layers = nn.Sequential(
             _block(dilation=1),
             _block(dilation=2),
-            _block(dilation=4),
+            _block(dilation=3),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -273,6 +329,7 @@ class HRM_Model(nn.Module):
         patch_size: tuple         = (2, 2),
         window_size: int          = 2,
         window_shift_size: int    = 1,
+        max_segments: int         = 20,
     ):
         super().__init__()
         patch_t = patch_size[0]
@@ -284,6 +341,15 @@ class HRM_Model(nn.Module):
             patch_t=patch_t,
             dropout=dropout,
         )
+
+        # Learned positional embedding over patch tokens. Without this the
+        # attention layers are permutation-equivariant and segment order is
+        # lost — so calling the local module an "encoder" only makes sense
+        # once positions are injected.
+        max_tokens = max_segments // patch_t + (max_segments % patch_t > 0)
+        self.pos_embed = nn.Parameter(torch.zeros(1, max_tokens, hidden_dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        self.pos_drop  = nn.Dropout(dropout)
 
         # ── Level 1: Windowed Self-Attention ─────────────────
         self.local_module = WindowedAttentionModule(
@@ -346,6 +412,11 @@ class HRM_Model(nn.Module):
         """
         # Patch embedding: [B, T, 2048] → [B, T//patch_t, hidden_dim]
         x_pat = self.patch_embed(x)
+
+        # Add positional embedding so segment order is preserved.
+        T_tok = x_pat.shape[1]
+        x_pat = x_pat + self.pos_embed[:, :T_tok, :]
+        x_pat = self.pos_drop(x_pat)
 
         # Level 1 — windowed self-attention (local)
         local_out = self.local_module(x_pat)       # [B, T', hidden_dim]
