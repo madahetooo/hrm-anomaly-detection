@@ -48,3 +48,22 @@ hrm-model-master-degree/
 .claude/
 
 # Anything > ~50MB really shouldn't be tracked; rely on patterns above
+
+# Correspondence and peer-review material — kept local, not for a public repo
+innovationteam_*.md
+sponsorship_email.md
+meeting_brief*.md
+cover_letter_*.md
+response_to_editor.md
+response_to_reviewers.md
+reviewer_analysis.md
+
+# Compressed artifacts
+*.zip
+*.gz
+
+# Scripts that embed employer correspondence or a withdrawn sponsorship claim
+generate_innovationteam_response.py
+generate_meeting_brief_ar.py
+generate_paper_*_sponsored*.py
+revision_history.md

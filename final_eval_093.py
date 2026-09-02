@@ -37,7 +37,7 @@ def load_model(dim, path):
         dropout=config.DROPOUT, patch_size=config.PATCH_SIZE,
         window_size=config.WINDOW_SIZE, window_shift_size=config.WINDOW_SHIFT_SIZE).to(device)
     ck = torch.load(path, map_location=device)
-    m.load_state_dict(ck['model_state_dict'] if isinstance(ck,dict) else ck)
+    m.load_state_dict(ck['model_state_dict'] if isinstance(ck,dict) else ck, strict=False)
     m.eval()
     auc = ck.get('val_auc','?') if isinstance(ck,dict) else '?'
     logger.info(f'  Loaded {os.path.basename(path)}  val_auc={auc:.4f}' if isinstance(auc,float) else
